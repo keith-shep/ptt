@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import termios
 import threading
 import time
 
@@ -175,10 +176,34 @@ def on_release(key):
         hotkey_released.set()
 
 
+def hide_typed_input():
+    # Dictating into this terminal window would echo the pasted text into our
+    # log. Turn off echo and return the original settings to restore later.
+    if not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    quiet = termios.tcgetattr(fd)
+    quiet[3] &= ~termios.ECHO
+    termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
+    return saved
+
+
+def restore_terminal(saved):
+    if saved is None:
+        return
+    fd = sys.stdin.fileno()
+    # Drop text pasted here while running, so the shell doesn't run it as a
+    # command after we exit.
+    termios.tcflush(fd, termios.TCIFLUSH)
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
 def shutdown():
     # A second Ctrl+C during cleanup quits immediately.
     signal.signal(signal.SIGINT, lambda *_: os._exit(130))
     listener.stop()
+    restore_terminal(saved_terminal)
     if stream is not None:
         try:
             stream.abort()  # don't leave the mic open
@@ -194,6 +219,7 @@ def shutdown():
 
 if __name__ == "__main__":
     print(f"Ready. Hold {args.key} to talk, release to paste. Ctrl+C to quit.")
+    saved_terminal = hide_typed_input()
     threading.Thread(target=recorder, daemon=True).start()
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
