@@ -15,7 +15,10 @@ Usage (inside your whisper-env):
 Quit with Ctrl+C in the terminal running it.
 """
 import argparse
+import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -150,11 +153,31 @@ def on_press(key):
         hotkey_pressed.set()
 
 
+def shutdown():
+    # A second Ctrl+C during cleanup quits immediately.
+    signal.signal(signal.SIGINT, lambda *_: os._exit(130))
+    listener.stop()
+    if stream is not None:
+        try:
+            stream.abort()  # don't leave the mic open
+            stream.close()
+        except Exception:
+            pass
+    print("\nBye.", flush=True)
+    sys.stderr.flush()
+    # Skip normal interpreter teardown: PortAudio, pynput's run loop and
+    # torch worker threads can block it, leaving the process hung after Ctrl+C.
+    os._exit(0)
+
+
 if __name__ == "__main__":
     print(f"Ready. Hold {args.key} to talk, release to paste. Ctrl+C to quit.")
     threading.Thread(target=recorder, daemon=True).start()
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
     try:
-        with keyboard.Listener(on_press=on_press) as listener:
-            listener.join()
+        while listener.is_alive():
+            listener.join(0.5)  # short timeouts keep Ctrl+C responsive
     except KeyboardInterrupt:
-        print("\nBye.")
+        pass
+    shutdown()
