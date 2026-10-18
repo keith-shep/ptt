@@ -20,12 +20,14 @@ import threading
 import time
 
 import numpy as np
+import Quartz  # installed with pynput on macOS
 import sounddevice as sd
 import whisper
 from pynput import keyboard
 
 SAMPLE_RATE = 16000      # Whisper expects 16 kHz mono
 MIN_SECONDS = 0.3        # ignore accidental taps
+POLL_SECONDS = 0.03      # how often to check the key while recording
 SILENCE_LEVEL = 0.01     # skip clips with no real sound (avoids Whisper inventing text)
 
 parser = argparse.ArgumentParser(description="Push-to-talk dictation with local Whisper")
@@ -47,9 +49,9 @@ model = whisper.load_model(args.model)
 
 kb = keyboard.Controller()
 transcribe_lock = threading.Lock()
+hotkey_pressed = threading.Event()
 frames = []
 stream = None
-recording = False
 
 
 def audio_callback(indata, frame_count, time_info, status):
@@ -57,19 +59,17 @@ def audio_callback(indata, frame_count, time_info, status):
 
 
 def start_recording():
-    global stream, frames, recording
+    global stream, frames
     frames = []
     # The mic is only open while the key is held.
     stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                             dtype="float32", callback=audio_callback)
     stream.start()
-    recording = True
     print("● Listening...", flush=True)
 
 
 def stop_recording():
-    global stream, recording
-    recording = False
+    global stream
     stream.stop()
     stream.close()
     stream = None
@@ -120,20 +120,41 @@ def paste(text):
     subprocess.run(["pbcopy"], input=previous)
 
 
+def hotkey_held():
+    # Ask macOS for the physical key state rather than trusting the listener
+    # to deliver the release: if that one event is lost, we would otherwise
+    # sit at "Listening..." forever.
+    return Quartz.CGEventSourceKeyState(
+        Quartz.kCGEventSourceStateHIDSystemState, HOTKEY.value.vk)
+
+
+def recorder():
+    while True:
+        hotkey_pressed.wait()
+        try:
+            start_recording()
+            while hotkey_held():
+                time.sleep(POLL_SECONDS)
+            stop_recording()
+        except Exception as e:
+            print(f"  (recording failed: {e})", flush=True)
+        hotkey_pressed.clear()
+
+
+# Listener callbacks run inside macOS's keyboard event tap and must return
+# at once. Opening or closing the mic there (slow with Bluetooth headsets, or
+# while Whisper has the CPU busy) can get the tap disabled by macOS, and
+# pynput never turns it back on, so the release is never seen.
 def on_press(key):
-    if key == HOTKEY and not recording:
-        start_recording()
-
-
-def on_release(key):
-    if key == HOTKEY and recording:
-        stop_recording()
+    if key == HOTKEY:
+        hotkey_pressed.set()
 
 
 if __name__ == "__main__":
     print(f"Ready. Hold {args.key} to talk, release to paste. Ctrl+C to quit.")
+    threading.Thread(target=recorder, daemon=True).start()
     try:
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        with keyboard.Listener(on_press=on_press) as listener:
             listener.join()
     except KeyboardInterrupt:
         print("\nBye.")
