@@ -53,6 +53,7 @@ model = whisper.load_model(args.model)
 kb = keyboard.Controller()
 transcribe_lock = threading.Lock()
 hotkey_pressed = threading.Event()
+hotkey_released = threading.Event()
 frames = []
 stream = None
 
@@ -71,15 +72,15 @@ def start_recording():
     print("● Listening...", flush=True)
 
 
-def stop_recording():
+def stop_recording(held_seconds):
     global stream
     stream.stop()
     stream.close()
     stream = None
 
     if not frames:
-        print("  (no audio captured: check Terminal has Microphone permission,"
-              " and hold the key a little longer)")
+        print(f"  (no audio captured after {held_seconds:.2f}s: check Terminal has"
+              " Microphone permission, and hold the key a little longer)")
         return
     audio = np.concatenate(frames).flatten()
     if len(audio) < SAMPLE_RATE * MIN_SECONDS:
@@ -131,14 +132,29 @@ def hotkey_held():
         Quartz.kCGEventSourceStateHIDSystemState, HOTKEY.value.vk)
 
 
+def wait_for_release():
+    # Stop on whichever notices the release first: the listener's release
+    # event, or the physical key state. The key state is only trusted once it
+    # has reported the key as held: without Input Monitoring permission macOS
+    # can report it as up the whole time, which would end every recording
+    # instantly.
+    key_state_works = False
+    while not hotkey_released.is_set():
+        if hotkey_held():
+            key_state_works = True
+        elif key_state_works:
+            return
+        time.sleep(POLL_SECONDS)
+
+
 def recorder():
     while True:
         hotkey_pressed.wait()
         try:
             start_recording()
-            while hotkey_held():
-                time.sleep(POLL_SECONDS)
-            stop_recording()
+            started = time.time()
+            wait_for_release()
+            stop_recording(time.time() - started)
         except Exception as e:
             print(f"  (recording failed: {e})", flush=True)
         hotkey_pressed.clear()
@@ -150,7 +166,13 @@ def recorder():
 # pynput never turns it back on, so the release is never seen.
 def on_press(key):
     if key == HOTKEY:
+        hotkey_released.clear()
         hotkey_pressed.set()
+
+
+def on_release(key):
+    if key == HOTKEY:
+        hotkey_released.set()
 
 
 def shutdown():
@@ -173,7 +195,7 @@ def shutdown():
 if __name__ == "__main__":
     print(f"Ready. Hold {args.key} to talk, release to paste. Ctrl+C to quit.")
     threading.Thread(target=recorder, daemon=True).start()
-    listener = keyboard.Listener(on_press=on_press)
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     try:
         while listener.is_alive():
