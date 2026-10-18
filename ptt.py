@@ -6,6 +6,9 @@ Hold Right Option, speak, release. The transcript is pasted wherever your
 cursor is (a chat box, a terminal, an editor). Everything runs on your Mac:
 no audio leaves the machine.
 
+A small badge follows the mouse pointer while it works: a red dot while
+listening, a spinner while transcribing.
+
 Usage (inside your whisper-env):
     python ptt.py                    # small.en: fast, good for clear speech
     python ptt.py --model turbo      # more accurate, slower
@@ -24,7 +27,19 @@ import threading
 import time
 
 import numpy as np
-import Quartz  # installed with pynput on macOS
+import Quartz  # installed with pynput on macOS (as is AppKit/Foundation)
+from AppKit import (
+    NSApplication, NSApplicationActivationPolicyAccessory, NSAppearance,
+    NSAppearanceNameDarkAqua, NSBackingStoreBuffered, NSBezierPath, NSColor,
+    NSControlSizeSmall, NSEvent, NSPanel, NSProgressIndicator,
+    NSProgressIndicatorStyleSpinning, NSScreen, NSStatusWindowLevel, NSTimer,
+    NSView, NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+    NSWindowCollectionBehaviorStationary, NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
+)
+from Foundation import NSInsetRect, NSMakeRect, NSObject, NSPointInRect
 import sounddevice as sd
 import whisper
 from pynput import keyboard
@@ -33,6 +48,9 @@ SAMPLE_RATE = 16000      # Whisper expects 16 kHz mono
 MIN_SECONDS = 0.3        # ignore accidental taps
 POLL_SECONDS = 0.03      # how often to check the key while recording
 SILENCE_LEVEL = 0.01     # skip clips with no real sound (avoids Whisper inventing text)
+BADGE_SIZE = 22          # points
+BADGE_OFFSET = 16        # gap between the pointer and the badge
+BADGE_FPS = 60           # how often the badge follows the pointer
 
 parser = argparse.ArgumentParser(description="Push-to-talk dictation with local Whisper")
 parser.add_argument("--model", default="small.en",
@@ -57,6 +75,9 @@ hotkey_pressed = threading.Event()
 hotkey_released = threading.Event()
 frames = []
 stream = None
+listening = threading.Event()  # mic is open
+pending = 0                    # transcriptions queued or running
+pending_lock = threading.Lock()
 
 
 def audio_callback(indata, frame_count, time_info, status):
@@ -70,11 +91,13 @@ def start_recording():
     stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                             dtype="float32", callback=audio_callback)
     stream.start()
+    listening.set()
     print("● Listening...", flush=True)
 
 
 def stop_recording(held_seconds):
-    global stream
+    global stream, pending
+    listening.clear()
     stream.stop()
     stream.close()
     stream = None
@@ -92,25 +115,36 @@ def stop_recording(held_seconds):
         return
 
     print(f"  transcribing {len(audio) / SAMPLE_RATE:.1f}s of audio...", flush=True)
+    with pending_lock:
+        pending += 1
     threading.Thread(target=transcribe_and_paste, args=(audio,), daemon=True).start()
 
 
 def transcribe_and_paste(audio):
-    with transcribe_lock:  # one transcription at a time, in order
-        started = time.time()
-        result = model.transcribe(
-            audio,
-            language="en",
-            fp16=False,                       # CPU on Mac
-            initial_prompt=args.prompt or None,
-            condition_on_previous_text=False,
-        )
-        text = result["text"].strip()
-        if not text:
-            print("  (nothing recognised)")
-            return
-        print(f"  → {text}  [{time.time() - started:.1f}s]")
-        paste(text + " ")
+    global pending
+    try:
+        with transcribe_lock:  # one transcription at a time, in order
+            _transcribe_and_paste(audio)
+    finally:
+        with pending_lock:
+            pending -= 1
+
+
+def _transcribe_and_paste(audio):
+    started = time.time()
+    result = model.transcribe(
+        audio,
+        language="en",
+        fp16=False,                       # CPU on Mac
+        initial_prompt=args.prompt or None,
+        condition_on_previous_text=False,
+    )
+    text = result["text"].strip()
+    if not text:
+        print("  (nothing recognised)")
+        return
+    print(f"  → {text}  [{time.time() - started:.1f}s]")
+    paste(text + " ")
 
 
 def paste(text):
@@ -158,6 +192,7 @@ def recorder():
             stop_recording(time.time() - started)
         except Exception as e:
             print(f"  (recording failed: {e})", flush=True)
+        listening.clear()
         hotkey_pressed.clear()
 
 
@@ -199,6 +234,106 @@ def restore_terminal(saved):
     termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
+# The badge is a small click-through panel that follows the mouse. macOS
+# doesn't let a background process change the pointer itself (the app in
+# front resets it), so this sits next to it instead. AppKit must run on the
+# main thread; the other threads only flip `listening` / `pending`, and a
+# timer here reads them.
+class BadgeView(NSView):
+    def drawRect_(self, rect):
+        bounds = self.bounds()
+        radius = bounds.size.width / 2
+        NSColor.colorWithCalibratedWhite_alpha_(0.1, 0.75).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, radius, radius).fill()
+        if badge_shown == "listening":
+            NSColor.systemRedColor().set()
+            NSBezierPath.bezierPathWithOvalInRect_(NSInsetRect(bounds, 6, 6)).fill()
+
+
+class BadgeTicker(NSObject):
+    def tick_(self, timer):
+        global badge_shown
+        if not listener.is_alive():
+            shutdown()
+
+        if listening.is_set():
+            wanted = "listening"
+        elif pending:
+            wanted = "transcribing"
+        else:
+            wanted = None
+
+        if wanted != badge_shown:
+            badge_shown = wanted
+            if wanted == "transcribing":
+                spinner.setHidden_(False)
+                spinner.startAnimation_(None)
+            else:
+                spinner.stopAnimation_(None)
+                spinner.setHidden_(True)
+            badge_view.setNeedsDisplay_(True)
+            if wanted is None:
+                badge.orderOut_(None)
+                return
+            badge.orderFrontRegardless()  # show without stealing focus
+        if wanted is not None:
+            badge.setFrameOrigin_(badge_origin(NSEvent.mouseLocation()))
+
+
+def badge_origin(pointer):
+    # Below and to the right of the pointer, flipped near screen edges.
+    x = pointer.x + BADGE_OFFSET
+    y = pointer.y - BADGE_OFFSET - BADGE_SIZE
+    for screen in NSScreen.screens():
+        frame = screen.frame()
+        if NSPointInRect(pointer, frame):
+            if x + BADGE_SIZE > frame.origin.x + frame.size.width:
+                x = pointer.x - BADGE_OFFSET - BADGE_SIZE
+            if y < frame.origin.y:
+                y = pointer.y + BADGE_OFFSET
+            break
+    return (x, y)
+
+
+def run_badge():
+    global badge, badge_view, spinner, ticker, badge_shown
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # no Dock icon
+
+    rect = NSMakeRect(0, 0, BADGE_SIZE, BADGE_SIZE)
+    badge = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        rect, NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+        NSBackingStoreBuffered, False)
+    badge.setOpaque_(False)
+    badge.setBackgroundColor_(NSColor.clearColor())
+    badge.setHasShadow_(False)
+    badge.setIgnoresMouseEvents_(True)
+    badge.setHidesOnDeactivate_(False)
+    badge.setLevel_(NSStatusWindowLevel)
+    badge.setCollectionBehavior_(
+        NSWindowCollectionBehaviorCanJoinAllSpaces
+        | NSWindowCollectionBehaviorStationary
+        | NSWindowCollectionBehaviorFullScreenAuxiliary
+        | NSWindowCollectionBehaviorIgnoresCycle)
+    badge.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
+
+    badge_view = BadgeView.alloc().initWithFrame_(rect)
+    badge.setContentView_(badge_view)
+    spinner = NSProgressIndicator.alloc().initWithFrame_(
+        NSMakeRect(3, 3, BADGE_SIZE - 6, BADGE_SIZE - 6))
+    spinner.setStyle_(NSProgressIndicatorStyleSpinning)
+    spinner.setControlSize_(NSControlSizeSmall)
+    spinner.setHidden_(True)
+    badge_view.addSubview_(spinner)
+
+    badge_shown = None
+    ticker = BadgeTicker.alloc().init()
+    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        1 / BADGE_FPS, ticker, "tick:", None, True)
+    app.run()
+
+
 def shutdown():
     # A second Ctrl+C during cleanup quits immediately.
     signal.signal(signal.SIGINT, lambda *_: os._exit(130))
@@ -223,9 +358,7 @@ if __name__ == "__main__":
     threading.Thread(target=recorder, daemon=True).start()
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
-    try:
-        while listener.is_alive():
-            listener.join(0.5)  # short timeouts keep Ctrl+C responsive
-    except KeyboardInterrupt:
-        pass
-    shutdown()
+    # The main thread now sits in AppKit's run loop. Python still runs this
+    # handler between badge timer ticks, so Ctrl+C stays responsive.
+    signal.signal(signal.SIGINT, lambda *_: shutdown())
+    run_badge()
